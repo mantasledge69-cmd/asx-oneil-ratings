@@ -1,0 +1,21 @@
+# Database - NEVER commit
+ASX_history.db
+*.db
+*.pkl
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+env/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/

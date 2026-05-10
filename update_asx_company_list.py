@@ -13,7 +13,8 @@ DB_PATH = 'ASX_history.db'
 DIRECTORY_URL = "https://asx.api.markitdigital.com/asx-research/1.0/companies/directory/file?"
 
 def update_company_list():
-    print("🚀 Updating ASX Company Master List...")
+    print("🚀 Updating ASX Company Master List with suspension tracking...")
+    logging.info("=== Company List Update Started ===")
 
     try:
         df = pd.read_csv(DIRECTORY_URL, dtype=str)
@@ -21,7 +22,7 @@ def update_company_list():
 
         print(f"Downloaded {len(df):,} total records from ASX")
 
-        # Active filter
+        # Separate active and suspended
         active_mask = (
             ~df['Market Cap'].isin(['SUSPENDED', '--', '', '0', None]) &
             df['Market Cap'].str.replace(',', '', regex=False)
@@ -30,39 +31,55 @@ def update_company_list():
         )
 
         active_df = df[active_mask].copy()
-        suspended_count = len(df) - len(active_df)
+        suspended_df = df[~active_mask].copy()
 
+        print(f"Active: {len(active_df):,} | Suspended: {len(suspended_df):,}")
+
+        # Process Active
         active_df['Market Cap Num'] = pd.to_numeric(
             active_df['Market Cap'].str.replace(',', '', regex=False), errors='coerce'
         )
-
         active_df = active_df.dropna(subset=['Market Cap Num', 'ASX code']).copy()
-
         active_df['Ticker'] = active_df['ASX code'] + '.AX'
-        active_df['updated_date'] = datetime.now().strftime('%Y-%m-%d')
         active_df['is_active'] = 1
 
-        active_df = active_df.rename(columns={
+        # Process Suspended
+        suspended_df['Ticker'] = suspended_df['ASX code'] + '.AX'
+        suspended_df['is_active'] = 0
+        suspended_df['Market Cap Num'] = 0
+
+        # Combine
+        all_df = pd.concat([active_df, suspended_df], ignore_index=True)
+
+        all_df['updated_date'] = datetime.now().strftime('%Y-%m-%d')
+
+        all_df = all_df.rename(columns={
             'Company name': 'Company',
             'GICs industry group': 'Industry_Group',
             'Listing date': 'listing_date'
         })
 
-        active_df = active_df.sort_values('Market Cap Num', ascending=False).reset_index(drop=True)
+        # Sort: Active first, then by market cap
+        all_df = all_df.sort_values(['is_active', 'Market Cap Num'], ascending=[False, False])
 
         final_cols = ['Ticker', 'ASX code', 'Company', 'Industry_Group',
                      'Market Cap', 'Market Cap Num', 'listing_date', 
                      'updated_date', 'is_active']
 
-        master_df = active_df[final_cols].copy()
+        master_df = all_df[final_cols].copy()
 
+        # Save
         conn = sqlite3.connect(DB_PATH)
         master_df.to_sql('company_list', conn, if_exists='replace', index=False)
         conn.close()
 
-        print(f"✅ SUCCESS: {len(master_df):,} active companies")
-        print(f"   Suspended/filtered: {suspended_count}")
+        # Final output
+        print(f"✅ TOTAL COMPANIES IN DB: {len(master_df):,}")
+        print(f"   Active: {len(active_df):,}")
+        print(f"   Suspended: {len(suspended_df):,}")
         print(f"   Largest: {master_df.iloc[0]['Company']} (${master_df.iloc[0]['Market Cap Num']:,.0f})")
+
+        logging.info(f"Updated {len(master_df)} companies | Active: {len(active_df)} | Suspended: {len(suspended_df)}")
 
     except Exception as e:
         print(f"❌ Error: {e}")

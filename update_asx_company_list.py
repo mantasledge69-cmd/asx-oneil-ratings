@@ -13,8 +13,8 @@ DB_PATH = 'ASX_history.db'
 DIRECTORY_URL = "https://asx.api.markitdigital.com/asx-research/1.0/companies/directory/file?"
 
 def update_company_list():
-    print("🚀 Updating ASX Company Master List with suspension tracking...")
-    logging.info("=== Company List Update Started ===")
+    print("🚀 Daily ASX Company List Update Started...")
+    logging.info("=== Daily Company List Update Started ===")
 
     try:
         df = pd.read_csv(DIRECTORY_URL, dtype=str)
@@ -22,7 +22,7 @@ def update_company_list():
 
         print(f"Downloaded {len(df):,} total records from ASX")
 
-        # Separate active and suspended
+        # Active vs Suspended
         active_mask = (
             ~df['Market Cap'].isin(['SUSPENDED', '--', '', '0', None]) &
             df['Market Cap'].str.replace(',', '', regex=False)
@@ -33,24 +33,19 @@ def update_company_list():
         active_df = df[active_mask].copy()
         suspended_df = df[~active_mask].copy()
 
-        print(f"Active: {len(active_df):,} | Suspended: {len(suspended_df):,}")
-
-        # Process Active
         active_df['Market Cap Num'] = pd.to_numeric(
             active_df['Market Cap'].str.replace(',', '', regex=False), errors='coerce'
         )
         active_df = active_df.dropna(subset=['Market Cap Num', 'ASX code']).copy()
+
         active_df['Ticker'] = active_df['ASX code'] + '.AX'
         active_df['is_active'] = 1
 
-        # Process Suspended
         suspended_df['Ticker'] = suspended_df['ASX code'] + '.AX'
         suspended_df['is_active'] = 0
         suspended_df['Market Cap Num'] = 0
 
-        # Combine
         all_df = pd.concat([active_df, suspended_df], ignore_index=True)
-
         all_df['updated_date'] = datetime.now().strftime('%Y-%m-%d')
 
         all_df = all_df.rename(columns={
@@ -59,7 +54,6 @@ def update_company_list():
             'Listing date': 'listing_date'
         })
 
-        # Sort: Active first, then by market cap
         all_df = all_df.sort_values(['is_active', 'Market Cap Num'], ascending=[False, False])
 
         final_cols = ['Ticker', 'ASX code', 'Company', 'Industry_Group',
@@ -68,18 +62,43 @@ def update_company_list():
 
         master_df = all_df[final_cols].copy()
 
-        # Save
+        # === Change Detection ===
         conn = sqlite3.connect(DB_PATH)
+        old_df = pd.read_sql("SELECT Ticker, is_active FROM company_list", conn)
+
+        old_tickers = set(old_df['Ticker'])
+        new_tickers = set(master_df['Ticker']) - old_tickers
+
+        # Status changes
+        current_status = master_df.set_index('Ticker')['is_active']
+        if not old_df.empty:
+            old_status = old_df.set_index('Ticker')['is_active']
+            status_changes = current_status.compare(old_status, keep_equal=False)
+
+        # Save
         master_df.to_sql('company_list', conn, if_exists='replace', index=False)
         conn.close()
 
-        # Final output
-        print(f"✅ TOTAL COMPANIES IN DB: {len(master_df):,}")
-        print(f"   Active: {len(active_df):,}")
-        print(f"   Suspended: {len(suspended_df):,}")
-        print(f"   Largest: {master_df.iloc[0]['Company']} (${master_df.iloc[0]['Market Cap Num']:,.0f})")
+        # === Smart Logging ===
+        print(f"✅ Updated: {len(master_df):,} total companies")
+        print(f"   Active: {len(active_df):,} | Suspended: {len(suspended_df):,}")
 
-        logging.info(f"Updated {len(master_df)} companies | Active: {len(active_df)} | Suspended: {len(suspended_df)}")
+        if new_tickers:
+            print(f"🆕 New tickers added: {len(new_tickers)}")
+            logging.info(f"NEW TICKERS: {sorted(list(new_tickers))[:20]}")
+
+        if 'status_changes' in locals() and not status_changes.empty:
+            suspended = status_changes[status_changes['self'] == 0].index.tolist()
+            reactivated = status_changes[status_changes['self'] == 1].index.tolist()
+            if suspended:
+                print(f"⛔ Suspended: {len(suspended)}")
+                logging.warning(f"SUSPENDED: {suspended[:10]}")
+            if reactivated:
+                print(f"✅ Reactivated: {len(reactivated)}")
+                logging.info(f"REACTIVATED: {reactivated[:10]}")
+
+        print(f"   Largest: {master_df.iloc[0]['Company']} (${master_df.iloc[0]['Market Cap Num']:,.0f})")
+        logging.info(f"Daily update completed - Active: {len(active_df)} | Suspended: {len(suspended_df)}")
 
     except Exception as e:
         print(f"❌ Error: {e}")

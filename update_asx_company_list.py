@@ -1,7 +1,7 @@
 import pandas as pd
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logging.basicConfig(
     filename='update_asx_company_list.log',
@@ -13,8 +13,8 @@ DB_PATH = 'ASX_history.db'
 DIRECTORY_URL = "https://asx.api.markitdigital.com/asx-research/1.0/companies/directory/file?"
 
 def update_company_list():
-    print("🚀 Daily ASX Company List Update Started...")
-    logging.info("=== Daily Company List Update Started ===")
+    print("🚀 Updating ASX Company Master List (Smart updated_date v2)...")
+    logging.info("=== Company List Update Started ===")
 
     try:
         df = pd.read_csv(DIRECTORY_URL, dtype=str)
@@ -33,20 +33,34 @@ def update_company_list():
         active_df = df[active_mask].copy()
         suspended_df = df[~active_mask].copy()
 
+        # Process Active
         active_df['Market Cap Num'] = pd.to_numeric(
             active_df['Market Cap'].str.replace(',', '', regex=False), errors='coerce'
         )
         active_df = active_df.dropna(subset=['Market Cap Num', 'ASX code']).copy()
-
         active_df['Ticker'] = active_df['ASX code'] + '.AX'
         active_df['is_active'] = 1
 
+        # Process Suspended
         suspended_df['Ticker'] = suspended_df['ASX code'] + '.AX'
         suspended_df['is_active'] = 0
         suspended_df['Market Cap Num'] = 0
 
         all_df = pd.concat([active_df, suspended_df], ignore_index=True)
-        all_df['updated_date'] = datetime.now().strftime('%Y-%m-%d')
+
+        # === Smart updated_date Logic ===
+        conn = sqlite3.connect(DB_PATH)
+        old_df = pd.read_sql("SELECT Ticker, updated_date FROM company_list", conn)
+        old_dict = dict(zip(old_df['Ticker'], old_df['updated_date']))
+
+        def get_updated_date(ticker):
+            if ticker in old_dict and old_dict[ticker]:
+                return old_dict[ticker]
+            else:
+                # New ticker = 1 year ago for full backfill
+                return (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+
+        all_df['updated_date'] = all_df['Ticker'].apply(get_updated_date)
 
         all_df = all_df.rename(columns={
             'Company name': 'Company',
@@ -62,43 +76,15 @@ def update_company_list():
 
         master_df = all_df[final_cols].copy()
 
-        # === Change Detection ===
-        conn = sqlite3.connect(DB_PATH)
-        old_df = pd.read_sql("SELECT Ticker, is_active FROM company_list", conn)
-
-        old_tickers = set(old_df['Ticker'])
-        new_tickers = set(master_df['Ticker']) - old_tickers
-
-        # Status changes
-        current_status = master_df.set_index('Ticker')['is_active']
-        if not old_df.empty:
-            old_status = old_df.set_index('Ticker')['is_active']
-            status_changes = current_status.compare(old_status, keep_equal=False)
-
-        # Save
         master_df.to_sql('company_list', conn, if_exists='replace', index=False)
         conn.close()
 
-        # === Smart Logging ===
-        print(f"✅ Updated: {len(master_df):,} total companies")
+        print(f"✅ TOTAL: {len(master_df):,} companies")
         print(f"   Active: {len(active_df):,} | Suspended: {len(suspended_df):,}")
-
-        if new_tickers:
-            print(f"🆕 New tickers added: {len(new_tickers)}")
-            logging.info(f"NEW TICKERS: {sorted(list(new_tickers))[:20]}")
-
-        if 'status_changes' in locals() and not status_changes.empty:
-            suspended = status_changes[status_changes['self'] == 0].index.tolist()
-            reactivated = status_changes[status_changes['self'] == 1].index.tolist()
-            if suspended:
-                print(f"⛔ Suspended: {len(suspended)}")
-                logging.warning(f"SUSPENDED: {suspended[:10]}")
-            if reactivated:
-                print(f"✅ Reactivated: {len(reactivated)}")
-                logging.info(f"REACTIVATED: {reactivated[:10]}")
-
+        print(f"   New tickers (will backfill 1 year): {len(all_df) - len(old_dict)}")
         print(f"   Largest: {master_df.iloc[0]['Company']} (${master_df.iloc[0]['Market Cap Num']:,.0f})")
-        logging.info(f"Daily update completed - Active: {len(active_df)} | Suspended: {len(suspended_df)}")
+
+        logging.info(f"Updated {len(master_df)} companies | Active: {len(active_df)} | Suspended: {len(suspended_df)}")
 
     except Exception as e:
         print(f"❌ Error: {e}")

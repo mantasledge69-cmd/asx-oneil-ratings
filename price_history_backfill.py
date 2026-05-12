@@ -16,6 +16,7 @@ BATCH_SIZE = 120
 MAX_RETRIES = 3
 SLEEP_BETWEEN_BATCHES = 4
 
+
 def get_backfill_start(ticker, conn):
     """STRICT: Use updated_date from company_list as hard floor"""
     cursor = conn.cursor()
@@ -41,6 +42,7 @@ def get_backfill_start(ticker, conn):
         start_date = updated_date
     
     return start_date
+
 
 def backfill_price_history():
     print("🚀 Starting STRICT updated_date ASX Price History Backfill...")
@@ -137,14 +139,18 @@ def backfill_price_history():
     conn.execute("UPDATE company_list SET updated_date = ? WHERE is_active = 1", (today,))
     conn.commit()
     
+    # Safe final summary BEFORE closing
+    total_rows = conn.execute('SELECT COUNT(*) FROM price_history').fetchone()[0]
+    today_inserted = inserted if 'inserted' in locals() else 0
     conn.close()
     
     duration = datetime.now() - start_time
     print(f"\n🎉 Backfill completed in {duration}")
-    print(f"   Total records: {conn.execute('SELECT COUNT(*) FROM price_history').fetchone()[0] if 'conn' in locals() else 'N/A'}")
+    print(f"   Records inserted/updated today: {today_inserted}")
+    print(f"   Total rows in price_history: {total_rows}")
     if failed:
         print(f"   Failed: {len(failed)}")
-    logging.info(f"Backfill completed | Duration: {duration}")
+    logging.info(f"Backfill completed | Duration: {duration} | Total rows: {total_rows}")
 
 if __name__ == "__main__":
     backfill_price_history()

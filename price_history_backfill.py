@@ -4,8 +4,8 @@ import yfinance as yf
 import logging
 from datetime import datetime, timedelta
 import time
-import os
 from tqdm import tqdm
+import os
 
 logging.basicConfig(
     filename='price_history_backfill.log',
@@ -14,21 +14,32 @@ logging.basicConfig(
 )
 
 DB_PATH = 'ASX_history.db'
-BATCH_SIZE = 50
+BATCH_SIZE = 120          # Increased for speed
 MAX_RETRIES = 3
-SLEEP_BETWEEN_BATCHES = 8   # seconds - be kind to YF
+SLEEP_BETWEEN_BATCHES = 4 # Reduced
+THREADS = 8
+
+def init_db_if_needed():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_history (
+            date TEXT,
+            ticker TEXT,
+            close REAL,
+            PRIMARY KEY (date, ticker)
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 def get_backfill_start(ticker, conn):
-    """Get the earliest date we should backfill from"""
     cursor = conn.cursor()
-    cursor.execute("SELECT MIN(date) FROM price_history WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT MAX(date) FROM price_history WHERE ticker = ?", (ticker,))
     result = cursor.fetchone()[0]
     
     if result:
-        # Already have some data → continue from last date
         return (datetime.strptime(result, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
     
-    # New ticker → use listing_date or updated_date
     cursor.execute("SELECT listing_date, updated_date FROM company_list WHERE Ticker = ?", (ticker,))
     row = cursor.fetchone()
     if row and row[0]:
@@ -36,102 +47,111 @@ def get_backfill_start(ticker, conn):
     elif row and row[1]:
         return row[1]
     else:
-        return (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')  # fallback 2 years
+        return (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')  # ~3 years fallback
 
 def backfill_price_history():
-    print("🚀 Starting ASX Price History Backfill (Batch Mode)...")
-    logging.info("=== Price History Backfill Started ===")
+    print("🚀 Starting FAST ASX Price History Backfill...")
+    logging.info("=== FAST Price History Backfill Started ===")
     start_time = datetime.now()
 
+    init_db_if_needed()
     conn = sqlite3.connect(DB_PATH)
     
     # Get active companies
-    df = pd.read_sql("SELECT Ticker, Company FROM company_list WHERE is_active = 1 ORDER BY \"Market Cap Num\" DESC", conn)
-    tickers = df['Ticker'].tolist()
+    df = pd.read_sql("SELECT Ticker FROM company_list WHERE is_active = 1 ORDER BY \"Market Cap Num\" DESC", conn)
+    tickers = [t + ".AX" if not t.endswith(".AX") else t for t in df['Ticker'].tolist()]
     
-    print(f"Found {len(tickers):,} active tickers to backfill")
+    print(f"Found {len(tickers):,} tickers")
     logging.info(f"Backfilling {len(tickers)} tickers")
 
-    success = 0
+    success_count = 0
+    total_inserted = 0
     failed = []
 
-    # Process in batches
+    pbar = tqdm(total=len(tickers), desc="Overall Progress")
+
     for i in range(0, len(tickers), BATCH_SIZE):
         batch = tickers[i:i + BATCH_SIZE]
         batch_str = " ".join(batch)
         
-        print(f"\n📦 Processing batch {i//BATCH_SIZE + 1}/{(len(tickers)+BATCH_SIZE-1)//BATCH_SIZE} → {len(batch)} tickers")
+        print(f"\n📦 Batch {i//BATCH_SIZE + 1} | {len(batch)} tickers")
         
         for attempt in range(MAX_RETRIES):
             try:
                 data = yf.download(
                     batch_str,
-                    start=None,           # let yfinance handle start per ticker where possible
                     period="max",
                     group_by='ticker',
                     auto_adjust=True,
-                    threads=True
+                    threads=THREADS,
+                    progress=False,
+                    prepost=False
                 )
                 
                 if data.empty:
-                    raise ValueError("Empty download")
+                    raise ValueError("Empty data")
                 
                 inserted = 0
+                conn_local = sqlite3.connect(DB_PATH)  # fresh connection
                 
-                for ticker in batch:
+                for ticker_raw in batch:
+                    ticker = ticker_raw.replace(".AX", "")
                     try:
                         if len(batch) > 1:
-                            ticker_data = data[ticker]['Close'].dropna()
+                            ticker_data = data[ticker_raw]['Close'].dropna()
                         else:
                             ticker_data = data['Close'].dropna()
-                            
+                        
                         if ticker_data.empty:
                             continue
-                            
+                        
                         df_ticker = pd.DataFrame({
                             'date': ticker_data.index.strftime('%Y-%m-%d'),
                             'ticker': ticker,
                             'close': ticker_data.values
                         })
                         
-                        # Get start date for this ticker
-                        start_date = get_backfill_start(ticker, conn)
+                        start_date = get_backfill_start(ticker, conn_local)
                         df_ticker = df_ticker[df_ticker['date'] >= start_date]
                         
                         if not df_ticker.empty:
-                            df_ticker.to_sql('price_history', conn, if_exists='append', index=False)
+                            df_ticker.to_sql('price_history', conn_local, if_exists='append', index=False, method='multi')
                             inserted += len(df_ticker)
-                            
                     except Exception as e_t:
-                        logging.warning(f"Error on {ticker}: {e_t}")
+                        logging.warning(f"Error processing {ticker}: {e_t}")
                         continue
                 
-                print(f"   ✅ Inserted/Updated {inserted:,} price records")
-                logging.info(f"Batch complete - {inserted} new records")
-                success += 1
+                conn_local.close()
+                print(f"   ✅ Inserted ~{inserted:,} records")
+                logging.info(f"Batch done - {inserted} new records")
+                success_count += 1
+                total_inserted += inserted
+                pbar.update(len(batch))
                 break
                 
             except Exception as e:
                 if attempt < MAX_RETRIES - 1:
-                    wait = SLEEP_BETWEEN_BATCHES * (attempt + 2)
-                    print(f"   ⚠️ Batch failed (attempt {attempt+1}), retrying in {wait}s...")
+                    wait = SLEEP_BETWEEN_BATCHES * (2 ** attempt)
+                    print(f"   ⚠️ Retry {attempt+1} in {wait}s...")
                     time.sleep(wait)
                 else:
-                    print(f"   ❌ Batch failed after {MAX_RETRIES} attempts")
+                    print(f"   ❌ Batch failed")
                     failed.extend(batch)
+                    pbar.update(len(batch))
                     logging.error(f"Batch failed: {e}")
+        
+        time.sleep(SLEEP_BETWEEN_BATCHES)
 
-        time.sleep(SLEEP_BETWEEN_BATCHES)  # polite delay between batches
-
+    pbar.close()
     conn.close()
     
     duration = datetime.now() - start_time
-    print(f"\n🎉 Backfill finished in {duration}")
-    print(f"   Successful batches: {success}/{len(tickers)//BATCH_SIZE + 1}")
+    print(f"\n🎉 Backfill completed in {duration}")
+    print(f"   Total records inserted: {total_inserted:,}")
     if failed:
-        print(f"   Failed tickers: {len(failed)} → check log")
+        print(f"   Failed: {len(failed)} tickers")
     
-    logging.info(f"Backfill completed | Duration: {duration} | Failed: {len(failed)}")
+    logging.info(f"Backfill finished | Duration: {duration} | Inserted: {total_inserted} | Failed: {len(failed)}")
 
 if __name__ == "__main__":
     backfill_price_history()

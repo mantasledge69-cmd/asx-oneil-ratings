@@ -15,7 +15,7 @@ conn = sqlite3.connect('ASX_history.db')
 cur = conn.cursor()
 
 # FIXED: Use correct table
-cur.execute("SELECT ticker FROM company_list WHERE status = 'Active'")
+cur.execute("SELECT ticker FROM company_list WHERE is_active = 1")
 tickers = [row[0] for row in cur.fetchall()]
 print(f"Found {len(tickers)} active tickers")
 

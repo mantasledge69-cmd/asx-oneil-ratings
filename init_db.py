@@ -1,58 +1,49 @@
+# init_db.py
 import sqlite3
 from datetime import datetime
 
-DB_PATH = 'ASX_history.db'
+print("🚀 Initializing clean ASX O'Neil Database (v2 - full schema)...")
 
-def init_database():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+conn = sqlite3.connect('ASX_history.db')
+cur = conn.cursor()
 
-    print("🚀 Initializing clean ASX O'Neil Database...")
+# === 1. Company List Table ===
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS company_list (
+        ticker TEXT PRIMARY KEY,
+        name TEXT,
+        sector TEXT,
+        industry TEXT,
+        market_cap REAL,
+        status TEXT,
+        listing_date TEXT,
+        updated_date TEXT
+    )
+""")
 
-    # Company List
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS company_list (
-            Ticker           TEXT PRIMARY KEY,
-            ASX_code         TEXT,
-            Company          TEXT,
-            Industry_Group   TEXT,
-            "Market Cap"     TEXT,
-            "Market Cap Num" REAL,
-            listing_date     TEXT,
-            updated_date     TEXT,
-            is_active        INTEGER DEFAULT 1
-        )
-    ''')
+# === 2. Price History Table (full OHLCV) ===
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS price_history (
+        date TEXT,
+        ticker TEXT,
+        open REAL,
+        high REAL,
+        low REAL,
+        close REAL,
+        volume INTEGER,
+        PRIMARY KEY (date, ticker)
+    )
+""")
 
-    # Price History - Minimal
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS price_history (
-            date    TEXT NOT NULL,
-            ticker  TEXT NOT NULL,
-            close   REAL NOT NULL,
-            PRIMARY KEY (date, ticker)
-        )
-    ''')
+# Indexes for speed
+cur.execute("CREATE INDEX IF NOT EXISTS idx_price_ticker ON price_history(ticker)")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_price_date ON price_history(date)")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_price_ticker_date ON price_history(ticker, date)")
 
-    # Sector History
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS sector_history (
-            date    TEXT NOT NULL,
-            ticker  TEXT NOT NULL,
-            close   REAL NOT NULL,
-            PRIMARY KEY (date, ticker)
-        )
-    ''')
+print("✅ Tables created: company_list + price_history (full OHLCV)")
 
-    # Indexes
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_price ON price_history(ticker, date)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_company_active ON company_list(is_active)')
+conn.commit()
+conn.close()
 
-    conn.commit()
-    conn.close()
-
-    print(f"✅ Database initialized successfully → {DB_PATH}")
-    print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-if __name__ == "__main__":
-    init_database()
+print(f"✅ Database initialized successfully → ASX_history.db")
+print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

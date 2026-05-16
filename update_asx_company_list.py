@@ -38,7 +38,7 @@ def update_company_list():
             active_df['Market Cap'].str.replace(',', '', regex=False), errors='coerce'
         )
         active_df = active_df.dropna(subset=['Market Cap Num', 'ASX code']).copy()
-        active_df['Ticker'] = active_df['ASX code'] + '.AX'
+        active_df['Ticker'] = active_df['ASX code'] + '.AX' # 
         active_df['is_active'] = 1
 
         # Process Suspended
@@ -57,8 +57,8 @@ def update_company_list():
             if ticker in old_dict and old_dict[ticker]:
                 return old_dict[ticker]
             else:
-                # New ticker = 1 year ago for full backfill
-                return (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+                # New ticker = 2 year ago for full backfill
+                return (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d') # 2 years for RS calcs (1 year lookback plotting)
 
         all_df['updated_date'] = all_df['Ticker'].apply(get_updated_date)
 

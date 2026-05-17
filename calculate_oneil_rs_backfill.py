@@ -4,7 +4,9 @@ import numpy as np
 from datetime import datetime, timedelta
 import logging
 import sys
-import yfinance as yf
+import warnings
+
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
@@ -48,34 +50,38 @@ def get_existing_dates():
     conn.close()
     return set(dates)
 
-def calculate_rs_for_date(target_date, price_dict, axjo_series):
+def calculate_rs_for_date(target_date, price_dict):
     results = []
+    target_dt = pd.to_datetime(target_date)
     for ticker, series in price_dict.items():
         try:
             if len(series) < 60:
                 continue
-            current = series.iloc[-1] if len(series) > 0 else None
-            if current is None or current <= 0:
+
+            # Get price at target date or closest prior
+            current = series.asof(target_dt)
+            if pd.isna(current) or current <= 0:
                 continue
 
-            idx = series.index.get_loc(target_date) if target_date in series.index else len(series) - 1
-            if idx < 30:
+            # Calculate periods using asof
+            p1m = series.asof(target_dt - timedelta(days=30))
+            p3m = series.asof(target_dt - timedelta(days=90))
+            p6m = series.asof(target_dt - timedelta(days=180))
+            p12m = series.asof(target_dt - timedelta(days=365))
+
+            r1m = (current / p1m - 1) * 100 if p1m and p1m > 0 else np.nan
+            r3m = (current / p3m - 1) * 100 if p3m and p3m > 0 else np.nan
+            r6m = (current / p6m - 1) * 100 if p6m and p6m > 0 else np.nan
+            r12m = (current / p12m - 1) * 100 if p12m and p12m > 0 else np.nan
+
+            # Clean nanmean
+            returns = [r for r in [r1m, r3m, r6m, r12m] if not np.isnan(r)]
+            rs_score = np.nanmean(returns) if returns else np.nan
+            if np.isnan(rs_score):
                 continue
 
-            p1m = series.iloc[max(0, idx - 21)]
-            p3m = series.iloc[max(0, idx - 63)]
-            p6m = series.iloc[max(0, idx - 126)]
-            p12m = series.iloc[max(0, idx - 252)]
-
-            r1m = (current / p1m - 1) * 100 if p1m > 0 else np.nan
-            r3m = (current / p3m - 1) * 100 if p3m > 0 else np.nan
-            r6m = (current / p6m - 1) * 100 if p6m > 0 else np.nan
-            r12m = (current / p12m - 1) * 100 if p12m > 0 else np.nan
-
-            rs_score = np.nanmean([r1m, r3m, r6m, r12m])
-
-            rs_relative = rs_score  # simplified for now
-            rs_chart = np.clip(rs_relative * 1.5, -350, 350)  # tuned scaling
+            rs_relative = rs_score  # TODO: add ^AXJO later
+            rs_chart = np.clip(rs_relative * 1.2, -350, 350)  # tuned for nice charts
 
             results.append({
                 'date': target_date,
@@ -95,7 +101,11 @@ def calculate_rs_for_date(target_date, price_dict, axjo_series):
 
     if results:
         rs_df = pd.DataFrame(results)
-        rs_df['rs_rating'] = pd.qcut(rs_df['rs_score'], q=99, labels=False, duplicates='drop') + 1
+        # Safe qcut
+        if len(rs_df) > 1:
+            rs_df['rs_rating'] = pd.qcut(rs_df['rs_score'], q=99, labels=False, duplicates='drop') + 1
+        else:
+            rs_df['rs_rating'] = 50
         return rs_df
     return pd.DataFrame()
 
@@ -128,7 +138,7 @@ def backfill_oneil_rs(months=13):
             continue
 
         try:
-            rs_df = calculate_rs_for_date(d_str, price_dict, None)
+            rs_df = calculate_rs_for_date(d_str, price_dict)
             if not rs_df.empty:
                 conn = sqlite3.connect(DB_PATH)
                 rs_df.to_sql('oneil_rs', conn, if_exists='append', index=False)
@@ -146,5 +156,5 @@ def backfill_oneil_rs(months=13):
     print(f"🎉 Backfill complete! Inserted {total_inserted:,} rows")
 
 if __name__ == "__main__":
-    init_oneil_rs_table(drop_existing=True)  # Force fresh schema
+    init_oneil_rs_table(drop_existing=True)
     backfill_oneil_rs(months=13)

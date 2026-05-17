@@ -1,59 +1,37 @@
-# init_db.py
 import sqlite3
-from datetime import datetime
+import pandas as pd
 
-print("🚀 Initializing ASX O'Neil Database v3 (with RS table)...")
-
-conn = sqlite3.connect('ASX_history.db')
-cur = conn.cursor()
-
-# Company List
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS company_list (
-        "Ticker" TEXT PRIMARY KEY,
-        "ASX code" TEXT,
-        "Company" TEXT,
-        "Industry_Group" TEXT,
-        "Market Cap" TEXT,
-        "Market Cap Num" INTEGER,
-        listing_date TEXT,
-        updated_date TEXT,
-        is_active INTEGER DEFAULT 1
-    )
-""")
-
-# Price History
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS price_history (
+def init_db():
+    conn = sqlite3.connect('ASX_history.db')
+    # Existing tables...
+    conn.execute('''CREATE TABLE IF NOT EXISTS price_history (
         date TEXT,
         ticker TEXT,
+        open REAL,
+        high REAL,
+        low REAL,
         close REAL,
+        volume INTEGER,
         PRIMARY KEY (date, ticker)
-    )
-""")
+    )''')
 
-# O'Neil RS Daily Table (this is what you asked for)
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS oneil_rs (
-        date TEXT,
-        ticker TEXT,
+    conn.execute('''CREATE TABLE IF NOT EXISTS oneil_rs (
+        date TEXT NOT NULL,
+        ticker TEXT NOT NULL,
         rs_value REAL,
-        rs_rank REAL,
+        rs_score REAL,
         rs_rating INTEGER,
+        rs_1m REAL,
+        rs_3m REAL,
+        rs_6m REAL,
+        rs_12m REAL,
+        rs_relative REAL,
+        rs_chart REAL,
         PRIMARY KEY (date, ticker)
-    )
-""")
+    )''')
+    conn.commit()
+    conn.close()
+    print("✅ Database initialized with full oneil_rs schema")
 
-# Indexes for speed
-cur.execute("CREATE INDEX IF NOT EXISTS idx_price_ticker ON price_history(ticker)")
-cur.execute("CREATE INDEX IF NOT EXISTS idx_rs_date ON oneil_rs(date)")
-cur.execute("CREATE INDEX IF NOT EXISTS idx_rs_ticker ON oneil_rs(ticker)")
-
-print("✅ Database tables ready:")
-print("   • company_list")
-print("   • price_history")
-print("   • oneil_rs (daily O'Neil RS - 1 year history)")
-
-conn.commit()
-conn.close()
-print(f"🎉 Database initialized at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+if __name__ == "__main__":
+    init_db()

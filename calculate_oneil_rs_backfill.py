@@ -4,6 +4,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import logging
 import sys
+import time
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
@@ -41,71 +42,10 @@ def get_existing_dates():
     conn.close()
     return set(dates)
 
-def calculate_rs_for_date(target_date, df_prices):
-    print(f"Calculating for {target_date}...")
-    conn = sqlite3.connect(DB_PATH)
-    exists = conn.execute("SELECT 1 FROM oneil_rs WHERE date = ? LIMIT 1", (target_date,)).fetchone()
-    conn.close()
-    if exists:
-        print(f"✅ Skipping {target_date} (already exists)")
-        return pd.DataFrame()
-
-    df_day = df_prices[df_prices['date'] == target_date]
-    if df_day.empty:
-        return pd.DataFrame()
-
-    results = []
-    tickers = df_prices['ticker'].unique()
-    for ticker in tickers:
-        try:
-            series = df_prices[df_prices['ticker'] == ticker].set_index('date')['close'].sort_index()
-            if len(series) < 60:
-                continue
-            current = series.asof(target_date)
-            if pd.isna(current):
-                continue
-
-            p1m = series.asof(pd.to_datetime(target_date) - timedelta(days=30))
-            p3m = series.asof(pd.to_datetime(target_date) - timedelta(days=90))
-            p6m = series.asof(pd.to_datetime(target_date) - timedelta(days=180))
-            p12m = series.asof(pd.to_datetime(target_date) - timedelta(days=365))
-
-            r1m = (current / p1m - 1) * 100 if pd.notna(p1m) and p1m > 0 else np.nan
-            r3m = (current / p3m - 1) * 100 if pd.notna(p3m) and p3m > 0 else np.nan
-            r6m = (current / p6m - 1) * 100 if pd.notna(p6m) and p6m > 0 else np.nan
-            r12m = (current / p12m - 1) * 100 if pd.notna(p12m) and p12m > 0 else np.nan
-
-            rs_score = np.nanmean([r1m, r3m, r6m, r12m])
-
-            results.append({
-                'date': target_date,
-                'ticker': ticker,
-                'rs_value': round(rs_score, 4),
-                'rs_score': round(rs_score, 4),
-                'rs_rating': None,
-                'rs_1m': round(r1m, 2) if not np.isnan(r1m) else None,
-                'rs_3m': round(r3m, 2) if not np.isnan(r3m) else None,
-                'rs_6m': round(r6m, 2) if not np.isnan(r6m) else None,
-                'rs_12m': round(r12m, 2) if not np.isnan(r12m) else None,
-                'rs_relative': round(rs_score, 4),  # simplified
-                'rs_chart': round(rs_score * 2, 2)  # temporary scaling
-            })
-        except:
-            continue
-
-    if results:
-        rs_df = pd.DataFrame(results)
-        valid_scores = rs_df['rs_score'].dropna()
-        if not valid_scores.empty:
-            rs_df['rs_rating'] = pd.qcut(valid_scores, q=99, labels=False, duplicates='drop') + 1
-            rs_df['rs_rating'] = rs_df['rs_rating'].reindex(rs_df.index, fill_value=50)
-        else:
-            rs_df['rs_rating'] = 50
-        return rs_df
-    return pd.DataFrame()
-
 def backfill_oneil_rs(months=12):
+    start_time = time.time()
     print(f"🚀 Starting {months}-month RS backfill...")
+
     conn = sqlite3.connect(DB_PATH)
     df_prices = pd.read_sql("""
         SELECT date, ticker, close 
@@ -119,26 +59,91 @@ def backfill_oneil_rs(months=12):
         print("No price data")
         return
 
-    df_prices['date'] = pd.to_datetime(df_prices['date']).dt.strftime('%Y-%m-%d')
+    df_prices['date'] = pd.to_datetime(df_prices['date'])
     existing_dates = get_existing_dates()
 
-    unique_dates = sorted([d for d in df_prices['date'].unique() if d])
-    start_idx = max(0, len(unique_dates) - 280)  # ~12 months
-    target_dates = unique_dates[start_idx:]
+    # Pre-group price series by ticker for speed
+    price_dict = {ticker: group.set_index('date')['close'].sort_index() for ticker, group in df_prices.groupby('ticker')}
+    print(f"Loaded {len(df_prices):,} price rows | {len(price_dict)} tickers")
 
-    print(f"Backfilling {len(target_dates)} dates...")
+    end_date = df_prices['date'].max()
+    start_date = end_date - timedelta(days=months*30 + 60)
+    trading_dates = sorted([d for d in df_prices['date'].unique() if d >= start_date])
 
-    for d in target_dates:
-        if d in existing_dates:
+    print(f"Backfilling {len(trading_dates)} dates...")
+
+    total_inserted = 0
+    for i, target_date_dt in enumerate(trading_dates):
+        target_date = target_date_dt.strftime('%Y-%m-%d')
+        if target_date in existing_dates:
             continue
-        rs_df = calculate_rs_for_date(d, df_prices)
-        if not rs_df.empty:
-            conn = sqlite3.connect(DB_PATH)
-            rs_df.to_sql('oneil_rs', conn, if_exists='append', index=False)
-            conn.close()
-            print(f"✅ Inserted {len(rs_df)} records for {d}")
 
-    print("🎉 Backfill complete!")
+        try:
+            results = []
+            for ticker, series in price_dict.items():
+                try:
+                    if len(series) < 60:
+                        continue
+                    current = series.iloc[-1] if target_date_dt >= series.index[-1] else series.asof(target_date_dt)
+                    if pd.isna(current):
+                        continue
+
+                    p1m  = series.asof(target_date_dt - timedelta(days=30))
+                    p3m  = series.asof(target_date_dt - timedelta(days=90))
+                    p6m  = series.asof(target_date_dt - timedelta(days=180))
+                    p12m = series.asof(target_date_dt - timedelta(days=365))
+
+                    r1m  = (current / p1m - 1) * 100 if p1m > 0 else np.nan
+                    r3m  = (current / p3m - 1) * 100 if p3m > 0 else np.nan
+                    r6m  = (current / p6m - 1) * 100 if p6m > 0 else np.nan
+                    r12m = (current / p12m - 1) * 100 if p12m > 0 else np.nan
+
+                    rs_score = np.nanmean([r1m, r3m, r6m, r12m])
+
+                    if np.isnan(rs_score):
+                        continue
+
+                    rs_relative = rs_score  # simplified for now
+                    rs_chart = np.clip(rs_relative * 1.5, -350, 350)  # tuned scale
+
+                    results.append({
+                        'date': target_date,
+                        'ticker': ticker,
+                        'rs_value': round(rs_score, 4),
+                        'rs_score': round(rs_score, 4),
+                        'rs_rating': None,
+                        'rs_1m': round(r1m, 2) if not np.isnan(r1m) else None,
+                        'rs_3m': round(r3m, 2) if not np.isnan(r3m) else None,
+                        'rs_6m': round(r6m, 2) if not np.isnan(r6m) else None,
+                        'rs_12m': round(r12m, 2) if not np.isnan(r12m) else None,
+                        'rs_relative': round(rs_relative, 4),
+                        'rs_chart': round(rs_chart, 2)
+                    })
+                except Exception as e:
+                    logging.warning(f"Ticker {ticker} on {target_date}: {e}")
+
+            if results:
+                rs_df = pd.DataFrame(results)
+                rs_df['rs_rating'] = pd.qcut(rs_df['rs_score'], q=99, labels=False, duplicates='drop') + 1
+
+                conn = sqlite3.connect(DB_PATH)
+                rs_df.to_sql('oneil_rs', conn, if_exists='append', index=False)
+                conn.close()
+
+                inserted = len(rs_df)
+                total_inserted += inserted
+                print(f"[{target_date}] ✅ Inserted {inserted:,} records")
+
+            # Progress
+            if (i + 1) % 10 == 0:
+                elapsed = time.time() - start_time
+                print(f"Progress: {i+1}/{len(trading_dates)} dates | Elapsed: {elapsed/60:.1f} min")
+
+        except Exception as e:
+            logging.error(f"Date {target_date}: {e}")
+            print(f"Error on {target_date}: {e}")
+
+    print(f"🎉 Backfill complete! Inserted {total_inserted:,} rows in {(time.time()-start_time)/60:.1f} minutes")
 
 if __name__ == "__main__":
     init_oneil_rs_table()

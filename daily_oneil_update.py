@@ -47,10 +47,11 @@ def main():
     steps = [
         ("update_asx_company_list.py",      "1. Update ASX Company Master List"),
         ("daily_price_update_smart.py",     "2. Update Latest Prices"),
-        ("calculate_rs_ratings.py",         "3. Calculate Stock RS Ratings"),
-        ("calculate_sector_rs.py",          "4. Calculate Sector RS Ratings"),
-        ("calculate_sector_emas.py",        "5. Calculate Sector EMAs"),
-        ("build_combined_view.py",          "6. Build Combined Dashboard View")
+        ("calculate_oneil_rs_backfill.py", "3. RS Backfill (if needed)"),  # safe, skips existing
+        ("calculate_oneil_rs.py",           "4. Latest Day RS"),  # we'll add this next
+        ("calculate_sector_rs.py",          "5. Calculate Sector RS Ratings"),
+        ("calculate_sector_emas.py",        "6. Calculate Sector EMAs"),
+        ("build_combined_view.py",          "7. Build Combined Dashboard View")
     ]
 
     success = 0
@@ -60,7 +61,7 @@ def main():
 
     duration = datetime.now() - start_time
     print(f"\n✅ Update finished in {duration}")
-    print(f"Successful steps: {success}/6")
+    print(f"Successful steps: {success}/7")
 
     if success >= 5:
         print("🎉 Core daily update completed successfully!")

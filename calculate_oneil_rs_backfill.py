@@ -31,10 +31,7 @@ def init_oneil_rs_table(drop_existing=False):
             rs_value REAL,
             rs_score REAL,
             rs_rating INTEGER,
-            rs_1m REAL,
-            rs_3m REAL,
-            rs_6m REAL,
-            rs_12m REAL,
+            rs_1m REAL, rs_3m REAL, rs_6m REAL, rs_12m REAL,
             rs_relative REAL,
             rs_chart REAL,
             PRIMARY KEY (date, ticker)
@@ -44,117 +41,104 @@ def init_oneil_rs_table(drop_existing=False):
     conn.close()
     print('✅ oneil_rs table ready (append-only)')
 
-def get_existing_dates():
+def get_price_dict():
     conn = sqlite3.connect(DB_PATH)
-    dates = pd.read_sql("SELECT DISTINCT date FROM oneil_rs", conn)['date'].tolist()
+    df = pd.read_sql("SELECT date, ticker, close FROM price_history ORDER BY ticker, date", conn)
     conn.close()
-    return set(dates)
+    df['date'] = pd.to_datetime(df['date'])
+    price_dict = {}
+    for ticker, group in df.groupby('ticker'):
+        price_dict[ticker] = group.set_index('date')['close'].sort_index()
+    return price_dict
 
-def calculate_rs_for_date(target_date, price_dict):
+def calculate_rs_for_date(target_date, price_dict, axjo_series=None):
     results = []
-    target_dt = pd.to_datetime(target_date)
+    current_dt = pd.to_datetime(target_date)
+
     for ticker, series in price_dict.items():
         try:
-            if len(series) < 60:
+            if len(series) < 60 or current_dt not in series.index:
                 continue
 
-            # Get price at target date or closest prior
-            current = series.asof(target_dt)
-            if pd.isna(current) or current <= 0:
-                continue
+            current = series[current_dt]
+            idx = series.index.get_loc(current_dt)
 
-            # Calculate periods using asof
-            p1m = series.asof(target_dt - timedelta(days=30))
-            p3m = series.asof(target_dt - timedelta(days=90))
-            p6m = series.asof(target_dt - timedelta(days=180))
-            p12m = series.asof(target_dt - timedelta(days=365))
+            p1m = series.iloc[max(0, idx-21)]
+            p3m = series.iloc[max(0, idx-63)]
+            p6m = series.iloc[max(0, idx-126)]
+            p12m = series.iloc[max(0, idx-252)]
 
-            r1m = (current / p1m - 1) * 100 if p1m and p1m > 0 else np.nan
-            r3m = (current / p3m - 1) * 100 if p3m and p3m > 0 else np.nan
-            r6m = (current / p6m - 1) * 100 if p6m and p6m > 0 else np.nan
-            r12m = (current / p12m - 1) * 100 if p12m and p12m > 0 else np.nan
+            r1m  = (current / p1m - 1) * 100 if p1m > 0 else np.nan
+            r3m  = (current / p3m - 1) * 100 if p3m > 0 else np.nan
+            r6m  = (current / p6m - 1) * 100 if p6m > 0 else np.nan
+            r12m = (current / p12m - 1) * 100 if p12m > 0 else np.nan
 
-            # Clean nanmean
             returns = [r for r in [r1m, r3m, r6m, r12m] if not np.isnan(r)]
-            rs_score = np.nanmean(returns) if returns else np.nan
+            rs_score = np.mean(returns) if returns else np.nan
+
             if np.isnan(rs_score):
                 continue
 
-            rs_relative = rs_score  # TODO: add ^AXJO later
-            rs_chart = np.clip(rs_relative * 1.2, -350, 350)  # tuned for nice charts
+            rs_rating = None  # will be filled later
+
+            rs_chart = np.clip(rs_score * 2.5, -350, 350)  # tuned scaling
 
             results.append({
                 'date': target_date,
                 'ticker': ticker,
                 'rs_value': round(rs_score, 4),
                 'rs_score': round(rs_score, 4),
-                'rs_rating': None,
+                'rs_rating': rs_rating,
                 'rs_1m': round(r1m, 2) if not np.isnan(r1m) else None,
                 'rs_3m': round(r3m, 2) if not np.isnan(r3m) else None,
                 'rs_6m': round(r6m, 2) if not np.isnan(r6m) else None,
                 'rs_12m': round(r12m, 2) if not np.isnan(r12m) else None,
-                'rs_relative': round(rs_relative, 4),
+                'rs_relative': round(rs_score, 4),
                 'rs_chart': round(rs_chart, 2)
             })
         except Exception as e:
-            logging.warning(f"RS calc error {ticker} on {target_date}: {e}")
+            logging.warning(f"Error {ticker} {target_date}: {e}")
 
     if results:
         rs_df = pd.DataFrame(results)
-        # Safe qcut
-        if len(rs_df) > 1:
+        # Fill ratings
+        if len(rs_df) > 10:
             rs_df['rs_rating'] = pd.qcut(rs_df['rs_score'], q=99, labels=False, duplicates='drop') + 1
-        else:
-            rs_df['rs_rating'] = 50
         return rs_df
     return pd.DataFrame()
 
 def backfill_oneil_rs(months=13):
     print(f'🚀 Starting {months}-month RS backfill...')
+    price_dict = get_price_dict()
+    print(f'Loaded {sum(len(s) for s in price_dict.values()):,} price rows | {len(price_dict)} tickers')
+
     conn = sqlite3.connect(DB_PATH)
-    df_prices = pd.read_sql("SELECT date, ticker, close FROM price_history ORDER BY ticker, date", conn)
+    existing = pd.read_sql("SELECT DISTINCT date FROM oneil_rs", conn)['date'].tolist()
     conn.close()
+    existing = set(existing)
 
-    if df_prices.empty:
-        print("No price data")
-        return
+    dates = sorted([d.strftime('%Y-%m-%d') for d in price_dict[list(price_dict.keys())[0]].index if d.strftime('%Y-%m-%d') not in existing])
+    dates = dates[-int(months*21):]  # approx trading days
 
-    df_prices['date'] = pd.to_datetime(df_prices['date'])
-    price_dict = {ticker: group.set_index('date')['close'].sort_index() for ticker, group in df_prices.groupby('ticker')}
-
-    print(f"Loaded {len(df_prices):,} price rows | {len(price_dict)} tickers")
-
-    existing_dates = get_existing_dates()
-    end_date = df_prices['date'].max()
-    start_date = end_date - timedelta(days=months*31)
-
-    trading_dates = sorted([d.strftime('%Y-%m-%d') for d in df_prices['date'].unique() if d >= start_date])
-
-    print(f"Backfilling {len(trading_dates)} dates...")
+    print(f'Backfilling {len(dates)} dates...')
 
     total_inserted = 0
-    for i, d_str in enumerate(trading_dates):
-        if d_str in existing_dates:
-            continue
-
+    for i, d in enumerate(dates):
         try:
-            rs_df = calculate_rs_for_date(d_str, price_dict)
+            rs_df = calculate_rs_for_date(d, price_dict)
             if not rs_df.empty:
                 conn = sqlite3.connect(DB_PATH)
                 rs_df.to_sql('oneil_rs', conn, if_exists='append', index=False)
                 conn.close()
+                print(f'[ {d} ] ✅ Inserted {len(rs_df)} records')
                 total_inserted += len(rs_df)
-                print(f"[ {d_str} ] ✅ Inserted {len(rs_df):,} records")
-
-            if (i + 1) % 10 == 0 or i == len(trading_dates)-1:
-                progress = (i+1) / len(trading_dates) * 100
-                print(f"Progress: {i+1}/{len(trading_dates)} ({progress:.1f}%) | Total inserted: {total_inserted:,}")
+                if (i+1) % 10 == 0:
+                    print(f'Progress: {i+1}/{len(dates)} ({(i+1)/len(dates)*100:.1f}%) | Total inserted: {total_inserted:,}')
         except Exception as e:
-            logging.error(f"Backfill failed for {d_str}: {e}")
-            print(f"❌ Error on {d_str}: {e}")
+            logging.error(f'Failed {d}: {e}')
 
-    print(f"🎉 Backfill complete! Inserted {total_inserted:,} rows")
+    print(f'🎉 Backfill complete! Inserted {total_inserted:,} rows')
 
 if __name__ == "__main__":
     init_oneil_rs_table(drop_existing=True)
-    backfill_oneil_rs(months=13)
+    backfill_oneil_rs()

@@ -16,30 +16,27 @@ def init_company_table():
     conn = sqlite3.connect(DB_PATH)
     conn.execute('''
         CREATE TABLE IF NOT EXISTS company_list (
-            Ticker TEXT PRIMARY KEY,
-            "ASX code" TEXT,
+            "ASX code" TEXT PRIMARY KEY,
             Company TEXT,
             Industry_Group TEXT,
             "Market Cap" TEXT,
-            "Market Cap Num" REAL,
             listing_date TEXT,
-            updated_date TEXT,
-            is_active INTEGER DEFAULT 1,
-            last_updated TEXT
+            updated_price_date TEXT,
+            CSV_updated TEXT,
+            is_active INTEGER DEFAULT 1
         )
     ''')
     conn.commit()
     conn.close()
-    logging.info("Company list table structure verified")
 
 def update_company_list():
-    print("🚀 Updating ASX Company Master List (Robust v17 - Enhanced Recovery)...")
+    print("🚀 Updating ASX Company Master List (v30 - Debug Mode)...")
     logging.info("=== Company List Update Started ===")
 
     try:
         df = pd.read_csv(DIRECTORY_URL, dtype=str, quotechar='"', on_bad_lines='skip')
         df.columns = [col.strip().replace('"', '').strip() for col in df.columns]
-        print(f"Downloaded {len(df):,} records | Columns: {list(df.columns)}")
+        print(f"Downloaded {len(df):,} records from ASX")
 
         df = df.rename(columns={
             'Company name': 'Company',
@@ -49,69 +46,84 @@ def update_company_list():
 
         df['Market Cap'] = df['Market Cap'].astype(str).str.strip()
 
-        active_mask = (
-            df['Market Cap'].notna() &
-            ~df['Market Cap'].isin(['SUSPENDED', '--', '', '0', 'nan']) &
-            df['Market Cap'].str.replace(r'[^0-9]', '', regex=True).str.len() > 0
-        )
+        # Debug: Show some sample Market Cap values
+        print("\nSample Market Cap values:")
+        print(df['Market Cap'].head(20).tolist())
+        print(df['Market Cap'].tail(10).tolist())
+
+        # Count how many contain SUSPENDED
+        susp_count = df['Market Cap'].str.contains(r'SUSPENDED', case=False, na=False).sum()
+        print(f"Number of rows with 'SUSPENDED': {susp_count}")
+
+        # Active = anything that is NOT explicitly SUSPENDED
+        active_mask = ~df['Market Cap'].str.contains(r'SUSPENDED', case=False, na=False)
 
         active_df = df[active_mask].copy()
         suspended_df = df[~active_mask].copy()
 
-        print(f"Detected Active: {len(active_df)} | Suspended: {len(suspended_df)}")
+        print(f"Final Detected → Active: {len(active_df)} | Suspended: {len(suspended_df)}")
 
-        # Process
-        active_df['Market Cap Num'] = pd.to_numeric(active_df['Market Cap'].str.replace(',', '', regex=False), errors='coerce')
-        active_df = active_df.dropna(subset=['ASX code']).copy()
-        active_df['Ticker'] = active_df['ASX code'].str.strip() + '.AX'
         active_df['is_active'] = 1
-
-        suspended_df['Ticker'] = suspended_df['ASX code'].str.strip() + '.AX'
         suspended_df['is_active'] = 0
-        suspended_df['Market Cap Num'] = 0.0
 
-        all_df = pd.concat([active_df, suspended_df], ignore_index=True).drop_duplicates(subset=['Ticker'])
+        all_df = pd.concat([active_df, suspended_df], ignore_index=True).drop_duplicates(subset=['ASX code'])
 
-        # === Robustness: Load old data and recover missing ===
+        csv_updated = datetime.now().strftime('%d-%m-%Y')
+
         conn = sqlite3.connect(DB_PATH)
         old_df = pd.read_sql("SELECT * FROM company_list", conn)
-        old_set = set(old_df['Ticker'])
+        old_set = set(old_df['ASX code'])
 
-        current_tickers = set(all_df['Ticker'])
-        missing_tickers = old_set - current_tickers
-        new_tickers = current_tickers - old_set
+        updates = []
+        new_companies = []
 
-        print(f"Missing from previous DB (will be recovered): {len(missing_tickers)}")
+        for _, row in all_df.iterrows():
+            code = row['ASX code']
+            old_row = old_df[old_df['ASX code'] == code]
 
-        # Smart updated_date preservation
-        old_date_dict = dict(zip(old_df['Ticker'], old_df['updated_date']))
+            if not old_row.empty:
+                old_active = int(old_row.iloc[0]['is_active'])
+                if old_active != int(row['is_active']):
+                    updates.append((
+                        row['Company'], row['Industry_Group'], row['Market Cap'],
+                        row['listing_date'], csv_updated, int(row['is_active']), code
+                    ))
+            else:
+                updated_price_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+                new_companies.append((
+                    code, row['Company'], row['Industry_Group'], row['Market Cap'],
+                    row['listing_date'], updated_price_date, csv_updated, int(row['is_active'])
+                ))
 
-        def get_updated_date(ticker):
-            return old_date_dict.get(ticker) or (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+        if updates:
+            conn.executemany('''
+                UPDATE company_list 
+                SET Company=?, Industry_Group=?, "Market Cap"=?, listing_date=?, 
+                    CSV_updated=?, is_active=?
+                WHERE "ASX code"=?
+            ''', updates)
 
-        all_df['updated_date'] = all_df['Ticker'].apply(get_updated_date)
-        all_df['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if new_companies:
+            print(f"\n📌 Adding {len(new_companies)} NEW companies to database:")
+            for company in new_companies:
+                asx_code = company[0]  # First element is "ASX code"
+                print(f"   → New: {asx_code}")
+            
+            conn.executemany('''
+                INSERT INTO company_list 
+                ("ASX code", Company, Industry_Group, "Market Cap", listing_date, 
+                 updated_price_date, CSV_updated, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', new_companies)
+            print(f"✅ Successfully inserted {len(new_companies)} new companies.")
 
-        final_cols = ['Ticker', 'ASX code', 'Company', 'Industry_Group',
-                     'Market Cap', 'Market Cap Num', 'listing_date', 
-                     'updated_date', 'is_active', 'last_updated']
-
-        master_df = all_df[final_cols].copy()
-
-        # Save
-        master_df.to_sql('company_list', conn, if_exists='replace', index=False)
+        conn.commit()
         conn.close()
 
-        print(f"✅ TOTAL: {len(master_df):,} companies")
-        print(f"   Active: {len(active_df):,} | Suspended: {len(suspended_df):,}")
-        print(f"   New: {len(new_tickers)} | Recovered missing: {len(missing_tickers)}")
-
-        if missing_tickers:
-            print(f"   Recovered examples: {sorted(list(missing_tickers))[:6]}...")
-        if new_tickers:
-            print(f"   New examples: {sorted(list(new_tickers))[:6]}...")
-
-        logging.info(f"Updated | Total: {len(master_df)} | Active: {len(active_df)} | Recovered: {len(missing_tickers)}")
+        print(f"\n✅ FINAL SUMMARY")
+        print(f"   TOTAL in DB: {len(old_df) + len(new_companies)}")
+        print(f"   Active: {len(active_df)} | Suspended: {len(suspended_df)}")
+        print(f"   New: {len(new_companies)} | Updated: {len(updates)}")
 
     except Exception as e:
         print(f"❌ Error: {e}")

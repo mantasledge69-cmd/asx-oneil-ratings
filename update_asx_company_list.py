@@ -30,7 +30,7 @@ def init_company_table():
     conn.close()
 
 def update_company_list():
-    print("🚀 Updating ASX Company Master List (v30 - Debug Mode)...")
+    print("🚀 Updating ASX Company Master List (v34 - Fixed Active Mask)...")
     logging.info("=== Company List Update Started ===")
 
     try:
@@ -46,22 +46,20 @@ def update_company_list():
 
         df['Market Cap'] = df['Market Cap'].astype(str).str.strip()
 
-        # Debug: Show some sample Market Cap values
-        print("\nSample Market Cap values:")
-        print(df['Market Cap'].head(20).tolist())
-        print(df['Market Cap'].tail(10).tolist())
+        # === FIXED Active Mask ===
+        df['Market Cap Clean'] = df['Market Cap'].str.replace(r'[^0-9]', '', regex=True)
 
-        # Count how many contain SUSPENDED
-        susp_count = df['Market Cap'].str.contains(r'SUSPENDED', case=False, na=False).sum()
-        print(f"Number of rows with 'SUSPENDED': {susp_count}")
-
-        # Active = anything that is NOT explicitly SUSPENDED
-        active_mask = ~df['Market Cap'].str.contains(r'SUSPENDED', case=False, na=False)
+        active_mask = (
+            df['Market Cap'].notna() &
+            ~df['Market Cap'].str.contains(r'SUSPENDED|--', case=False, na=True) &
+            (df['Market Cap'].str.strip() != '') &
+            (df['Market Cap Clean'].str.len() > 3)          # At least 4 digits for active companies
+        )
 
         active_df = df[active_mask].copy()
         suspended_df = df[~active_mask].copy()
 
-        print(f"Final Detected → Active: {len(active_df)} | Suspended: {len(suspended_df)}")
+        print(f"Detected Active: {len(active_df)} | Suspended: {len(suspended_df)}")
 
         active_df['is_active'] = 1
         suspended_df['is_active'] = 0
@@ -72,7 +70,6 @@ def update_company_list():
 
         conn = sqlite3.connect(DB_PATH)
         old_df = pd.read_sql("SELECT * FROM company_list", conn)
-        old_set = set(old_df['ASX code'])
 
         updates = []
         new_companies = []
@@ -104,24 +101,18 @@ def update_company_list():
             ''', updates)
 
         if new_companies:
-            print(f"\n📌 Adding {len(new_companies)} NEW companies to database:")
-            for company in new_companies:
-                asx_code = company[0]  # First element is "ASX code"
-                print(f"   → New: {asx_code}")
-            
             conn.executemany('''
                 INSERT INTO company_list 
                 ("ASX code", Company, Industry_Group, "Market Cap", listing_date, 
                  updated_price_date, CSV_updated, is_active)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', new_companies)
-            print(f"✅ Successfully inserted {len(new_companies)} new companies.")
 
         conn.commit()
         conn.close()
 
         print(f"\n✅ FINAL SUMMARY")
-        print(f"   TOTAL in DB: {len(old_df) + len(new_companies)}")
+        print(f"   TOTAL: {len(old_df) + len(new_companies)} companies")
         print(f"   Active: {len(active_df)} | Suspended: {len(suspended_df)}")
         print(f"   New: {len(new_companies)} | Updated: {len(updates)}")
 

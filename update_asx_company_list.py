@@ -30,7 +30,7 @@ def init_company_table():
     conn.close()
 
 def update_company_list():
-    print("🚀 Updating ASX Company Master List (v34 - Fixed Active Mask)...")
+    print("🚀 Updating ASX Company Master List (v37 - Ultra Simple Reliable)...")
     logging.info("=== Company List Update Started ===")
 
     try:
@@ -46,15 +46,8 @@ def update_company_list():
 
         df['Market Cap'] = df['Market Cap'].astype(str).str.strip()
 
-        # === FIXED Active Mask ===
-        df['Market Cap Clean'] = df['Market Cap'].str.replace(r'[^0-9]', '', regex=True)
-
-        active_mask = (
-            df['Market Cap'].notna() &
-            ~df['Market Cap'].str.contains(r'SUSPENDED|--', case=False, na=True) &
-            (df['Market Cap'].str.strip() != '') &
-            (df['Market Cap Clean'].str.len() > 3)          # At least 4 digits for active companies
-        )
+        # === ULTRA SIMPLE ACTIVE DETECTION ===
+        active_mask = ~df['Market Cap'].str.contains(r'SUSPENDED', case=False, na=False)
 
         active_df = df[active_mask].copy()
         suspended_df = df[~active_mask].copy()
@@ -67,6 +60,7 @@ def update_company_list():
         all_df = pd.concat([active_df, suspended_df], ignore_index=True).drop_duplicates(subset=['ASX code'])
 
         csv_updated = datetime.now().strftime('%d-%m-%Y')
+        two_years_ago = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
 
         conn = sqlite3.connect(DB_PATH)
         old_df = pd.read_sql("SELECT * FROM company_list", conn)
@@ -76,6 +70,8 @@ def update_company_list():
 
         for _, row in all_df.iterrows():
             code = row['ASX code']
+            updated_price_date = two_years_ago   # Safe default for new companies
+
             old_row = old_df[old_df['ASX code'] == code]
 
             if not old_row.empty:
@@ -86,7 +82,6 @@ def update_company_list():
                         row['listing_date'], csv_updated, int(row['is_active']), code
                     ))
             else:
-                updated_price_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
                 new_companies.append((
                     code, row['Company'], row['Industry_Group'], row['Market Cap'],
                     row['listing_date'], updated_price_date, csv_updated, int(row['is_active'])

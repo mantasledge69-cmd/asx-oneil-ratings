@@ -14,7 +14,7 @@ logging.basicConfig(
 DB_PATH = 'ASX_history.db'
 
 def update_price_history():
-    print("🚀 Starting Price History Update (v5 - Defensive Column Fix)...")
+    print("🚀 Starting Price History Update (v12 - Robust Column Handling)...")
     logging.info("=== Price History Update Started ===")
 
     try:
@@ -35,7 +35,8 @@ def update_price_history():
 
         for idx, row in enumerate(df.iterrows(), 1):
             _, row = row
-            ticker = row['ASX code'] + '.AX'
+            asx_code = row['ASX code']
+            ticker = asx_code + '.AX'
             start_date = row['updated_price_date']
             
             print(f"[{idx:4d}/{len(df)}] {ticker} from {start_date}...", end=' ')
@@ -51,44 +52,49 @@ def update_price_history():
                 )
                 
                 if not data.empty:
-                    # Force clean DataFrame
-                    data = data.reset_index()
-                    data = data[['Date', 'Close']].copy()
-                    data.columns = ['date', 'close']
-                    data['ticker'] = ticker
+                    # Robust close price extraction
+                    if 'Close' in data.columns:
+                        close_series = data['Close']
+                    elif 'Adj Close' in data.columns:
+                        close_series = data['Adj Close']
+                    else:
+                        close_series = data.iloc[:, 3]  # fallback to 4th column
                     
-                    # Insert only the exact columns that exist
-                    insert_data = data[['date', 'ticker', 'close']]
+                    closes = close_series.reset_index()
+                    closes.columns = ['date', 'close']
+                    closes['ASX code'] = asx_code
+                    closes['date'] = closes['date'].dt.strftime('%Y-%m-%d')
                     
-                    insert_data.to_sql('price_history', conn, if_exists='append', index=False)
+                    closes[['date', 'ASX code', 'close']].to_sql('price_history', conn, if_exists='append', index=False)
                     
                     # Update last successful date
+                    last_date = closes['date'].max()
                     conn.execute('''
                         UPDATE company_list 
                         SET updated_price_date = ? 
                         WHERE "ASX code" = ?
-                    ''', (today, row['ASX code']))
+                    ''', (last_date, asx_code))
                     
                     success_count += 1
-                    print(f"✅ {len(data)} rows")
+                    print(f"✅ {len(closes)} rows")
                 else:
                     print("⚠️ No data")
                     failed.append((ticker, "No data"))
 
             except Exception as e:
                 error_msg = str(e)
-                print(f"❌ Failed - {error_msg[:80]}")
+                print(f"❌ Failed - {error_msg[:100]}")
                 logging.error(f"Failed {ticker}: {error_msg}")
-                failed.append((ticker, error_msg[:80]))
+                failed.append((ticker, error_msg[:100]))
 
             time.sleep(0.7)
 
         conn.commit()
         conn.close()
 
-        print(f"\n✅ Price Update Complete!")
+        print(f"\n✅ Price History Update Complete!")
         print(f"   Successfully updated : {success_count} companies")
-        print(f"   Failed               : {len(failed)}")
+        print(f"   Failed               : {len(failed)} companies")
 
         if failed:
             print("\nFirst 10 failed:")

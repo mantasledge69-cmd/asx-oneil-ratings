@@ -104,32 +104,63 @@ def update_price_history():
                     continue
             
             if not data.empty:
-                # Robust close price extraction (same as before)
-                if 'Close' in data.columns:
-                    close_series = data['Close']
-                elif 'Adj Close' in data.columns:
-                    close_series = data['Adj Close']
-                else:
-                    close_series = data.iloc[:, 3]
-                
-                closes = close_series.reset_index()
-                closes.columns = ['date', 'close']
-                closes['ASX code'] = asx_code
-                closes['date'] = closes['date'].dt.strftime('%Y-%m-%d')
-                
-                # Append to DB (price_history table)
-                closes[['date', 'ASX code', 'close']].to_sql('price_history', conn, if_exists='append', index=False)
-                
-                # Update last successful date in company_list
-                last_date = closes['date'].max()
-                conn.execute('''
-                    UPDATE company_list 
-                    SET updated_price_date = ? 
-                    WHERE "ASX code" = ?
-                ''', (last_date, asx_code))
-                
-                success_count += 1
-                print(f" {len(closes)} rows {'(from pkl)' if used_pkl else '(from YF + cached)'}")
+                try:
+                    # Robust close price extraction (same as before)
+                    if 'Close' in data.columns:
+                        close_series = data['Close']
+                    elif 'Adj Close' in data.columns:
+                        close_series = data['Adj Close']
+                    else:
+                        close_series = data.iloc[:, 3]
+                    
+                    closes = close_series.reset_index()
+                    closes.columns = ['date', 'close']
+                    closes['ASX code'] = asx_code
+                    closes['date'] = closes['date'].dt.strftime('%Y-%m-%d')
+                    
+                    # Drop rows with missing/invalid close prices.
+                    # yfinance often returns NaN closes for illiquid or suspended stocks.
+                    closes['close'] = pd.to_numeric(closes['close'], errors='coerce')
+                    closes = closes.dropna(subset=['close'])
+                    
+                    if closes.empty:
+                        print(" no valid close prices (all NaN)")
+                        failed.append((ticker, "No valid close prices"))
+                        time.sleep(0.5)
+                        continue
+                    
+                    # Filter to only dates newer than what we already have in DB.
+                    # This is critical for safety with PKL caching + when re-running yf.download
+                    # with a start_date that overlaps previously inserted data.
+                    cur = conn.cursor()
+                    cur.execute('SELECT MAX(date) FROM price_history WHERE "ASX code" = ?', (asx_code,))
+                    max_existing = cur.fetchone()[0]
+                    if max_existing:
+                        closes = closes[closes['date'] > max_existing]
+                    
+                    if closes.empty:
+                        print(" up to date (no new rows)")
+                    else:
+                        # Append only truly new rows (prevents UNIQUE constraint violation)
+                        closes[['date', 'ASX code', 'close']].to_sql('price_history', conn, if_exists='append', index=False)
+                        
+                        # Update last successful date in company_list
+                        last_date = closes['date'].max()
+                        conn.execute('''
+                            UPDATE company_list 
+                            SET updated_price_date = ? 
+                            WHERE "ASX code" = ?
+                        ''', (last_date, asx_code))
+                        
+                        success_count += 1
+                        print(f" {len(closes)} new rows {'(from pkl)' if used_pkl else '(from YF + cached)'}")
+                except Exception as e:
+                    error_msg = str(e)
+                    print(f" Failed processing - {error_msg[:80]}")
+                    logging.error(f"Processing failed {ticker}: {error_msg}")
+                    failed.append((ticker, error_msg[:100]))
+                    time.sleep(0.5)
+                    continue
             else:
                 print(" No new data")
                 failed.append((ticker, "No data"))

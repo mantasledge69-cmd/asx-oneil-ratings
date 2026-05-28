@@ -4,7 +4,10 @@ import sqlite3
 import logging
 from datetime import datetime, timedelta
 import time
+import os
+import pickle
 
+# === PROJECT LOGGING (per-file .log as required) ===
 logging.basicConfig(
     filename='update_price_history.log',
     level=logging.INFO,
@@ -12,10 +15,40 @@ logging.basicConfig(
 )
 
 DB_PATH = 'ASX_history.db'
+PKL_DIR = 'data/pkl'
+
+os.makedirs(PKL_DIR, exist_ok=True)
+
+
+def get_fresh_pkl(asx_code: str, max_age_hours: int = 24):
+    """Load cached yfinance data from pkl if it exists and is fresh (today or within max_age_hours)."""
+    pkl_path = os.path.join(PKL_DIR, f"{asx_code}.pkl")
+    if os.path.exists(pkl_path):
+        try:
+            file_age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(pkl_path))
+            if file_age.total_seconds() < (max_age_hours * 3600):
+                with open(pkl_path, 'rb') as f:
+                    data = pickle.load(f)
+                return data, True  # fresh pkl loaded
+        except Exception as e:
+            logging.warning(f"Failed to load pkl for {asx_code}: {e}")
+    return None, False
+
+
+def save_to_pkl(asx_code: str, data):
+    """Save full yfinance DataFrame to pkl for future speed."""
+    pkl_path = os.path.join(PKL_DIR, f"{asx_code}.pkl")
+    try:
+        with open(pkl_path, 'wb') as f:
+            pickle.dump(data, f)
+        logging.info(f"Saved fresh pkl cache for {asx_code}")
+    except Exception as e:
+        logging.error(f"Failed to save pkl for {asx_code}: {e}")
+
 
 def update_price_history():
-    print("🚀 Starting Price History Update (v12 - Robust Column Handling)...")
-    logging.info("=== Price History Update Started ===")
+    print("Starting Price History Update (v13 - PKL Caching Enabled)...")
+    logging.info("=== Price History Update Started (with daily pkl caching) ===")
 
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -27,11 +60,12 @@ def update_price_history():
             ORDER BY "ASX code"
         """, conn)
         
-        print(f"Found {len(df)} active companies to update\n")
+        print(f"Found {len(df)} active companies to update (pkl cache will be used when fresh)\n")
 
         today = datetime.now().strftime('%Y-%m-%d')
         success_count = 0
         failed = []
+        pkl_hits = 0
 
         for idx, row in enumerate(df.iterrows(), 1):
             _, row = row
@@ -41,59 +75,73 @@ def update_price_history():
             
             print(f"[{idx:4d}/{len(df)}] {ticker} from {start_date}...", end=' ')
             
-            try:
-                data = yf.download(
-                    ticker, 
-                    start=start_date, 
-                    end=today, 
-                    progress=False, 
-                    auto_adjust=True,
-                    timeout=10
-                )
-                
-                if not data.empty:
-                    # Robust close price extraction
-                    if 'Close' in data.columns:
-                        close_series = data['Close']
-                    elif 'Adj Close' in data.columns:
-                        close_series = data['Adj Close']
-                    else:
-                        close_series = data.iloc[:, 3]  # fallback to 4th column
+            # === PKL CACHING LOGIC (core requirement) ===
+            data, used_pkl = get_fresh_pkl(asx_code)
+            
+            if used_pkl and not data.empty:
+                pkl_hits += 1
+                print(" [PKL HIT - instant]", end=' ')
+            else:
+                # Only call Yahoo Finance if no fresh pkl
+                try:
+                    data = yf.download(
+                        ticker, 
+                        start=start_date, 
+                        end=today, 
+                        progress=False, 
+                        auto_adjust=True,
+                        timeout=15
+                    )
+                    if not data.empty:
+                        save_to_pkl(asx_code, data)  # cache for next run
                     
-                    closes = close_series.reset_index()
-                    closes.columns = ['date', 'close']
-                    closes['ASX code'] = asx_code
-                    closes['date'] = closes['date'].dt.strftime('%Y-%m-%d')
-                    
-                    closes[['date', 'ASX code', 'close']].to_sql('price_history', conn, if_exists='append', index=False)
-                    
-                    # Update last successful date
-                    last_date = closes['date'].max()
-                    conn.execute('''
-                        UPDATE company_list 
-                        SET updated_price_date = ? 
-                        WHERE "ASX code" = ?
-                    ''', (last_date, asx_code))
-                    
-                    success_count += 1
-                    print(f"✅ {len(closes)} rows")
+                except Exception as e:
+                    error_msg = str(e)
+                    print(f" Failed YF - {error_msg[:80]}")
+                    logging.error(f"YF download failed {ticker}: {error_msg}")
+                    failed.append((ticker, error_msg[:100]))
+                    time.sleep(0.7)
+                    continue
+            
+            if not data.empty:
+                # Robust close price extraction (same as before)
+                if 'Close' in data.columns:
+                    close_series = data['Close']
+                elif 'Adj Close' in data.columns:
+                    close_series = data['Adj Close']
                 else:
-                    print("⚠️ No data")
-                    failed.append((ticker, "No data"))
+                    close_series = data.iloc[:, 3]
+                
+                closes = close_series.reset_index()
+                closes.columns = ['date', 'close']
+                closes['ASX code'] = asx_code
+                closes['date'] = closes['date'].dt.strftime('%Y-%m-%d')
+                
+                # Append to DB (price_history table)
+                closes[['date', 'ASX code', 'close']].to_sql('price_history', conn, if_exists='append', index=False)
+                
+                # Update last successful date in company_list
+                last_date = closes['date'].max()
+                conn.execute('''
+                    UPDATE company_list 
+                    SET updated_price_date = ? 
+                    WHERE "ASX code" = ?
+                ''', (last_date, asx_code))
+                
+                success_count += 1
+                print(f" {len(closes)} rows {'(from pkl)' if used_pkl else '(from YF + cached)'}")
+            else:
+                print(" No new data")
+                failed.append((ticker, "No data"))
 
-            except Exception as e:
-                error_msg = str(e)
-                print(f"❌ Failed - {error_msg[:100]}")
-                logging.error(f"Failed {ticker}: {error_msg}")
-                failed.append((ticker, error_msg[:100]))
-
-            time.sleep(0.7)
+            time.sleep(0.5)  # polite delay
 
         conn.commit()
         conn.close()
 
-        print(f"\n✅ Price History Update Complete!")
+        print(f"\n Price History Update Complete!")
         print(f"   Successfully updated : {success_count} companies")
+        print(f"   PKL cache hits       : {pkl_hits} (instant, no YF call)")
         print(f"   Failed               : {len(failed)} companies")
 
         if failed:
@@ -101,9 +149,12 @@ def update_price_history():
             for t, reason in failed[:10]:
                 print(f"   {t} → {reason}")
 
+        logging.info(f"Update finished. Success={success_count}, PKL hits={pkl_hits}, Failed={len(failed)}")
+
     except Exception as e:
-        print(f"❌ Critical Error: {e}")
+        print(f" Critical Error: {e}")
         logging.error(f"Critical failure: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
     update_price_history()
